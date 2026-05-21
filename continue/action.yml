@@ -126,6 +126,8 @@ runs:
       if: steps.chain.outputs.found == 'true'
       shell: bash
       env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
         TRUNK: ${{ inputs.trunk }}
         # The merged PR's pre-merge HEAD SHA — the cut-point for
         # rebasing the new bottom: commits AFTER this SHA in the next
@@ -140,6 +142,7 @@ runs:
         # Trunk exists locally only as origin/<trunk> after checkout.
         git branch -f "$TRUNK" "origin/$TRUNK"
 
+        # --- Labeled chain ---
         count=0
         while IFS=$'\t' read -r head _base; do
           git fetch --no-tags origin "$head"
@@ -165,7 +168,61 @@ runs:
           count=$((count + 1))
         done < /tmp/chain.tsv
 
-        echo "Restacked and pushed $count branch(es)."
+        # --- Trailing chain ---
+        # PRs that sit ABOVE the labeled chain in the same git-stack
+        # (i.e. they descend from the just-merged PR or from the top
+        # of the labeled chain's old tip). We rebase them onto the new
+        # top so they don't bit-rot, but we do NOT enable auto-merge
+        # on them — the user only asked for the labeled set to ship.
+        #
+        # Detection uses git ancestry rather than GitHub base refs:
+        # GitHub auto-retargets dependent PRs to the trunk as soon as
+        # their base branch is deleted, so base-ref queries can't
+        # reliably identify a trailing chain after a merge.
+        mapfile -t open_prs < <(gh pr list --repo "$REPO" --state open \
+          --json number,headRefName \
+          -q '.[] | [.number, .headRefName] | @tsv')
+
+        declare -A in_labeled_chain
+        while IFS=$'\t' read -r head _base; do
+          in_labeled_chain[$head]=1
+        done < /tmp/chain.tsv
+
+        trailing_unsorted=()
+        for row in "${open_prs[@]}"; do
+          num="$(cut -f1 <<<"$row")"
+          head="$(cut -f2 <<<"$row")"
+          [[ -n "${in_labeled_chain[$head]:-}" ]] && continue
+          # Fetch this PR's head so we can check git ancestry locally.
+          if ! git fetch --no-tags origin "$head" 2>/dev/null; then
+            continue
+          fi
+          if git merge-base --is-ancestor "$prev_old_tip" \
+              "refs/remotes/origin/$head" 2>/dev/null; then
+            # In a linear stack each PR has exactly one more commit
+            # since the cut-point than the PR below it, so sorting by
+            # rev-list --count ascending gives bottom→top order.
+            depth="$(git rev-list --count \
+              "${prev_old_tip}..refs/remotes/origin/$head")"
+            trailing_unsorted+=("$(printf '%s\t%s\t%s' \
+              "$depth" "$num" "$head")")
+          fi
+        done
+
+        trailing_count=0
+        while IFS=$'\t' read -r _depth _num head; do
+          [[ -z "$head" ]] && continue
+          this_old_tip="$(git rev-parse "refs/remotes/origin/$head")"
+          git checkout -B "$head" "$this_old_tip"
+          git rebase --onto "$new_base" "$prev_old_tip"
+          git push --force-with-lease="$head:$this_old_tip" \
+            origin "HEAD:refs/heads/$head"
+          prev_old_tip="$this_old_tip"
+          new_base="$head"
+          trailing_count=$((trailing_count + 1))
+        done < <(printf '%s\n' "${trailing_unsorted[@]+"${trailing_unsorted[@]}"}" | sort -n)
+
+        echo "Restacked $count labeled + $trailing_count trailing branch(es)."
 
     - name: On failure — strip labels and comment
       if: failure() && steps.restack.outcome == 'failure'

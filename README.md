@@ -31,6 +31,19 @@ label from every remaining labeled PR and comments on each with the
 failed run URL — so the stack pauses safely instead of leaving
 half-rebased branches around.
 
+### Labeling a non-top PR
+
+You can label **any** PR in the stack — the action merges everything
+up to and including the labeled PR. For example, in a stack of
+`#57 → #58 → #59 → #60 → #61 → #62`, labeling **#59** merges #57,
+#58, and #59 in order, then stops.
+
+PRs that sit above the labeled PR in the same stack (here: #60, #61,
+#62) are **rebased** onto the new `main` so they don't show stale
+"conflicting" status in the GitHub UI, but they are **not merged**.
+If you decide to ship them later, label the top of the remaining
+stack and the cascade resumes.
+
 ## Prerequisites
 
 In the repository where you're using this action:
