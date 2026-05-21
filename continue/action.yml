@@ -192,21 +192,28 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.token }}
         REPO: ${{ github.repository }}
-        LABEL: ${{ inputs.label }}
-        TRUNK: ${{ inputs.trunk }}
+        # Use the bottom PR number computed at workflow start, NOT a
+        # fresh `gh pr list --base <trunk>` query. If the bottom PR had
+        # auto-merge enabled from a prior run (or has no required
+        # status checks), GitHub can auto-merge it within seconds of
+        # our force-push — before this step runs. A fresh query would
+        # then return empty and the workflow would exit thinking the
+        # stack is fully merged, skipping the next continue trigger.
+        BOTTOM_NUM: ${{ steps.chain.outputs.bottom_num }}
       run: |
         set -euo pipefail
-        new_bottom="$(gh pr list --repo "$REPO" --state open \
-          --label "$LABEL" --base "$TRUNK" \
-          --json number -q '.[0].number')"
-        if [[ -z "$new_bottom" ]]; then
-          echo "No labeled PR targeting $TRUNK remains — stack fully merged."
+        # If the bottom has already merged during this run, skip
+        # gracefully — the merge event will trigger another continue
+        # run that picks up the now-new bottom.
+        state="$(gh pr view "$BOTTOM_NUM" --repo "$REPO" --json state -q .state)"
+        if [[ "$state" != "OPEN" ]]; then
+          echo "PR #$BOTTOM_NUM is $state; the continue run triggered by its merge will handle the next bottom."
           exit 0
         fi
         # Idempotent: see start/action.yml for rationale.
-        if ! out=$(gh pr merge "$new_bottom" --repo "$REPO" --squash --auto 2>&1); then
+        if ! out=$(gh pr merge "$BOTTOM_NUM" --repo "$REPO" --squash --auto 2>&1); then
           if [[ "$out" == *"Merge already in progress"* ]]; then
-            echo "Auto-merge already enabled on PR #$new_bottom."
+            echo "Auto-merge already enabled on PR #$BOTTOM_NUM."
           else
             echo "$out" >&2
             exit 1
