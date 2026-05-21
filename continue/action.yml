@@ -44,9 +44,17 @@ runs:
         # Explicitly exclude the just-merged PR. `--state open` should
         # already filter it out, but GitHub's API can briefly report a
         # merged PR as still open due to eventual consistency.
+        # `--limit 1000` because gh's default of 30 silently truncates
+        # large stacks. `isCrossRepository == false` skips fork PRs —
+        # their branches can't be fetched from `origin`, so a later
+        # `git fetch` and rebase would fail. Same filters as the
+        # trailing-chain query below.
         gh pr list --repo "$REPO" --state open --label "$LABEL" \
-          --json number,headRefName,baseRefName \
-          -q ".[] | select(.number != $MERGED_PR_NUMBER and .headRefName != \"$MERGED_HEAD_REF\") | [.number, .headRefName, .baseRefName] | @tsv" \
+          --limit 1000 \
+          --json number,headRefName,baseRefName,isCrossRepository \
+          | jq -r --argjson merged_num "$MERGED_PR_NUMBER" \
+               --arg merged_ref "$MERGED_HEAD_REF" \
+               '.[] | select(.number != $merged_num and .headRefName != $merged_ref and .isCrossRepository == false) | [.number, .headRefName, .baseRefName] | @tsv' \
           > /tmp/labeled.tsv
 
         # Always create chain.tsv (possibly empty). The rebase step
@@ -66,14 +74,25 @@ runs:
           # Bottom = a labeled head whose base is not another labeled
           # head (i.e. its base is the trunk after GitHub's
           # auto-retarget).
+          # Prioritize the PR that directly followed the merged one to
+          # handle multiple independent stacks sharing the same label.
           bottom_head=""
           for head in "${!num_by_head[@]}"; do
-            base="${base_by_head[$head]}"
-            if [[ -z "${num_by_head[$base]:-}" ]]; then
+            if [[ "${base_by_head[$head]}" == "$MERGED_HEAD_REF" ]]; then
               bottom_head="$head"
               break
             fi
           done
+
+          if [[ -z "$bottom_head" ]]; then
+            for head in "${!num_by_head[@]}"; do
+              base="${base_by_head[$head]}"
+              if [[ -z "${num_by_head[$base]:-}" ]]; then
+                bottom_head="$head"
+                break
+              fi
+            done
+          fi
 
           if [[ -z "$bottom_head" ]]; then
             echo "::error::Could not find a bottom of the labeled chain (cycle?). labeled.tsv:"
@@ -194,8 +213,9 @@ runs:
         # their base branch is deleted, so base-ref queries can't
         # reliably identify a trailing chain after a merge.
         mapfile -t open_prs < <(gh pr list --repo "$REPO" --state open \
-          --json number,headRefName \
-          -q '.[] | [.number, .headRefName] | @tsv')
+          --limit 1000 \
+          --json number,headRefName,isCrossRepository \
+          -q '.[] | select(.isCrossRepository == false) | [.number, .headRefName] | @tsv')
 
         declare -A in_labeled_chain
         while IFS=$'\t' read -r head _base; do
