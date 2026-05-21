@@ -36,6 +36,7 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
         REPO: ${{ github.repository }}
         LABEL: ${{ inputs.label }}
+        TRUNK: ${{ inputs.trunk }}
         MERGED_PR_NUMBER: ${{ github.event.pull_request.number }}
         MERGED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
       run: |
@@ -48,61 +49,73 @@ runs:
           -q ".[] | select(.number != $MERGED_PR_NUMBER and .headRefName != \"$MERGED_HEAD_REF\") | [.number, .headRefName, .baseRefName] | @tsv" \
           > /tmp/labeled.tsv
 
-        if [[ ! -s /tmp/labeled.tsv ]]; then
-          echo "No remaining labeled PRs; nothing to do."
-          echo "found=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        declare -A num_by_head base_by_head
-        while IFS=$'\t' read -r num head base; do
-          num_by_head[$head]="$num"
-          base_by_head[$head]="$base"
-        done < /tmp/labeled.tsv
-
-        # Bottom = a labeled head whose base is not another labeled head
-        # (i.e. its base is the trunk after GitHub's auto-retarget).
-        bottom_head=""
-        for head in "${!num_by_head[@]}"; do
-          base="${base_by_head[$head]}"
-          if [[ -z "${num_by_head[$base]:-}" ]]; then
-            bottom_head="$head"
-            break
-          fi
-        done
-
-        if [[ -z "$bottom_head" ]]; then
-          echo "::error::Could not find a bottom of the labeled chain (cycle?). labeled.tsv:"
-          cat /tmp/labeled.tsv
-          exit 1
-        fi
-
-        # Walk bottom→top, emitting "<head>\t<base>" per row.
+        # Always create chain.tsv (possibly empty). The rebase step
+        # iterates over it for the labeled pass; an empty file makes
+        # that pass a no-op, leaving only the trailing pass to run.
         : > /tmp/chain.tsv
-        cur="$bottom_head"
         top_head=""
-        while [[ -n "$cur" ]]; do
-          printf '%s\t%s\n' "$cur" "${base_by_head[$cur]}" >> /tmp/chain.tsv
-          top_head="$cur"
-          next=""
-          for h in "${!num_by_head[@]}"; do
-            if [[ "${base_by_head[$h]}" == "$cur" ]]; then
-              next="$h"
+        bottom_num=""
+
+        if [[ -s /tmp/labeled.tsv ]]; then
+          declare -A num_by_head base_by_head
+          while IFS=$'\t' read -r num head base; do
+            num_by_head[$head]="$num"
+            base_by_head[$head]="$base"
+          done < /tmp/labeled.tsv
+
+          # Bottom = a labeled head whose base is not another labeled
+          # head (i.e. its base is the trunk after GitHub's
+          # auto-retarget).
+          bottom_head=""
+          for head in "${!num_by_head[@]}"; do
+            base="${base_by_head[$head]}"
+            if [[ -z "${num_by_head[$base]:-}" ]]; then
+              bottom_head="$head"
               break
             fi
           done
-          cur="$next"
-        done
 
-        if [[ -z "$top_head" ]]; then
-          echo "::error::Chain walk produced an empty top_head."
-          exit 1
+          if [[ -z "$bottom_head" ]]; then
+            echo "::error::Could not find a bottom of the labeled chain (cycle?). labeled.tsv:"
+            cat /tmp/labeled.tsv
+            exit 1
+          fi
+
+          # Walk bottom→top, emitting "<head>\t<base>" per row.
+          cur="$bottom_head"
+          while [[ -n "$cur" ]]; do
+            printf '%s\t%s\n' "$cur" "${base_by_head[$cur]}" >> /tmp/chain.tsv
+            top_head="$cur"
+            next=""
+            for h in "${!num_by_head[@]}"; do
+              if [[ "${base_by_head[$h]}" == "$cur" ]]; then
+                next="$h"
+                break
+              fi
+            done
+            cur="$next"
+          done
+
+          if [[ -z "$top_head" ]]; then
+            echo "::error::Chain walk produced an empty top_head."
+            exit 1
+          fi
+
+          bottom_num="${num_by_head[$bottom_head]}"
+        else
+          # No labeled PRs remain — this is the run triggered by the
+          # LAST labeled PR's merge. The labeled pass is a no-op, but
+          # the trailing pass still needs to rebase PRs above the
+          # just-merged one. Check out the trunk so actions/checkout
+          # has a valid ref.
+          echo "No remaining labeled PRs; running trailing-rebase only."
+          top_head="$TRUNK"
         fi
 
         {
           echo "found=true"
           echo "top_head=$top_head"
-          echo "bottom_num=${num_by_head[$bottom_head]}"
+          echo "bottom_num=$bottom_num"
         } >> "$GITHUB_OUTPUT"
         echo "----- chain.tsv -----"
         cat /tmp/chain.tsv
@@ -138,9 +151,10 @@ runs:
         set -euo pipefail
 
         prev_old_tip="$MERGED_PR_HEAD_SHA"
-        new_base="$TRUNK"
-        # Trunk exists locally only as origin/<trunk> after checkout.
-        git branch -f "$TRUNK" "origin/$TRUNK"
+        # Use origin/<trunk> directly — avoids creating a local trunk
+        # branch (which would fail when the labeled chain is empty and
+        # actions/checkout left us ON the trunk).
+        new_base="origin/$TRUNK"
 
         # --- Labeled chain ---
         count=0
@@ -244,7 +258,10 @@ runs:
         exit 1
 
     - name: Enable auto-merge on new bottom
-      if: success() && steps.chain.outputs.found == 'true'
+      # Skip when bottom_num is empty — that means the labeled chain
+      # was empty for this run (only the trailing pass executed), so
+      # there's no "next labeled bottom" to enable auto-merge on.
+      if: success() && steps.chain.outputs.bottom_num != ''
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
