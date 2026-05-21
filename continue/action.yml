@@ -46,7 +46,7 @@ runs:
         # merged PR as still open due to eventual consistency.
         gh pr list --repo "$REPO" --state open --label "$LABEL" \
           --json number,headRefName,baseRefName \
-          | jq --argjson merged_num "$MERGED_PR_NUMBER" \
+          | jq -r --argjson merged_num "$MERGED_PR_NUMBER" \
                --arg merged_ref "$MERGED_HEAD_REF" \
                '.[] | select(.number != $merged_num and .headRefName != $merged_ref) | [.number, .headRefName, .baseRefName] | @tsv' \
           > /tmp/labeled.tsv
