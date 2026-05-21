@@ -1,0 +1,214 @@
+name: Stackmerge — Continue
+description: |
+  Triggered when a labeled PR is merged. Computes the remaining labeled
+  chain, rebases each branch onto its new base (via
+  `git rebase --onto`), force-pushes the rebased SHAs, and enables
+  auto-merge on the new bottom PR.
+
+  Pair with `kalbasit/stackmerge-action/start` in a separate workflow
+  that fires on `pull_request: labeled`.
+
+inputs:
+  token:
+    description: |
+      GitHub token used to fetch, force-push restacked branches, and
+      enable auto-merge on the new bottom. A Personal Access Token
+      with `repo` scope is required — pushes made with the built-in
+      `GITHUB_TOKEN` do not trigger downstream workflows, so the
+      restacked branches would never re-run CI for the next merge.
+    required: true
+  label:
+    description: "Label that marks PRs as part of an in-flight stack merge."
+    required: false
+    default: merge-stack
+  trunk:
+    description: "Trunk branch name."
+    required: false
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - name: Compute remaining labeled chain (bottom→top)
+      id: chain
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        LABEL: ${{ inputs.label }}
+        MERGED_PR_NUMBER: ${{ github.event.pull_request.number }}
+        MERGED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      run: |
+        set -euo pipefail
+        # Explicitly exclude the just-merged PR. `--state open` should
+        # already filter it out, but GitHub's API can briefly report a
+        # merged PR as still open due to eventual consistency.
+        gh pr list --repo "$REPO" --state open --label "$LABEL" \
+          --json number,headRefName,baseRefName \
+          -q ".[] | select(.number != $MERGED_PR_NUMBER and .headRefName != \"$MERGED_HEAD_REF\") | [.number, .headRefName, .baseRefName] | @tsv" \
+          > /tmp/labeled.tsv
+
+        if [[ ! -s /tmp/labeled.tsv ]]; then
+          echo "No remaining labeled PRs; nothing to do."
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        declare -A num_by_head base_by_head
+        while IFS=$'\t' read -r num head base; do
+          num_by_head[$head]="$num"
+          base_by_head[$head]="$base"
+        done < /tmp/labeled.tsv
+
+        # Bottom = a labeled head whose base is not another labeled head
+        # (i.e. its base is the trunk after GitHub's auto-retarget).
+        bottom_head=""
+        for head in "${!num_by_head[@]}"; do
+          base="${base_by_head[$head]}"
+          if [[ -z "${num_by_head[$base]:-}" ]]; then
+            bottom_head="$head"
+            break
+          fi
+        done
+
+        if [[ -z "$bottom_head" ]]; then
+          echo "::error::Could not find a bottom of the labeled chain (cycle?). labeled.tsv:"
+          cat /tmp/labeled.tsv
+          exit 1
+        fi
+
+        # Walk bottom→top, emitting "<head>\t<base>" per row.
+        : > /tmp/chain.tsv
+        cur="$bottom_head"
+        top_head=""
+        while [[ -n "$cur" ]]; do
+          printf '%s\t%s\n' "$cur" "${base_by_head[$cur]}" >> /tmp/chain.tsv
+          top_head="$cur"
+          next=""
+          for h in "${!num_by_head[@]}"; do
+            if [[ "${base_by_head[$h]}" == "$cur" ]]; then
+              next="$h"
+              break
+            fi
+          done
+          cur="$next"
+        done
+
+        if [[ -z "$top_head" ]]; then
+          echo "::error::Chain walk produced an empty top_head."
+          exit 1
+        fi
+
+        {
+          echo "found=true"
+          echo "top_head=$top_head"
+          echo "bottom_num=${num_by_head[$bottom_head]}"
+        } >> "$GITHUB_OUTPUT"
+        echo "----- chain.tsv -----"
+        cat /tmp/chain.tsv
+
+    - uses: actions/checkout@v6
+      if: steps.chain.outputs.found == 'true'
+      with:
+        token: ${{ inputs.token }}
+        ref: ${{ steps.chain.outputs.top_head }}
+        fetch-depth: 0
+
+    - name: Configure git identity
+      if: steps.chain.outputs.found == 'true'
+      shell: bash
+      run: |
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git config user.name  "github-actions[bot]"
+
+    - name: Rebase remaining stack onto trunk and force-push
+      id: restack
+      if: steps.chain.outputs.found == 'true'
+      shell: bash
+      env:
+        TRUNK: ${{ inputs.trunk }}
+        # The merged PR's pre-merge HEAD SHA — the cut-point for
+        # rebasing the new bottom: commits AFTER this SHA in the next
+        # branch are "the new bottom's own work", which we replay onto
+        # the trunk (dropping the squash-merged ancestor commits).
+        MERGED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+
+        prev_old_tip="$MERGED_PR_HEAD_SHA"
+        new_base="$TRUNK"
+        # Trunk exists locally only as origin/<trunk> after checkout.
+        git branch -f "$TRUNK" "origin/$TRUNK"
+
+        count=0
+        while IFS=$'\t' read -r head _base; do
+          git fetch --no-tags origin "$head"
+          this_old_tip="$(git rev-parse "refs/remotes/origin/$head")"
+
+          # `-B` creates or resets the branch at the given SHA. Works
+          # whether the branch already exists locally (the top one was
+          # set up by actions/checkout) or not (the rest).
+          git checkout -B "$head" "$this_old_tip"
+
+          # Take commits in this branch that came AFTER prev_old_tip
+          # and replay them onto new_base. Drops squash-merged or
+          # pre-rebase ancestor commits cleanly.
+          git rebase --onto "$new_base" "$prev_old_tip"
+
+          # Force-push, but only if remote is still at the SHA we just
+          # fetched — protects against concurrent pushes.
+          git push --force-with-lease="$head:$this_old_tip" \
+            origin "HEAD:refs/heads/$head"
+
+          prev_old_tip="$this_old_tip"
+          new_base="$head"
+          count=$((count + 1))
+        done < /tmp/chain.tsv
+
+        echo "Restacked and pushed $count branch(es)."
+
+    - name: On failure — strip labels and comment
+      if: failure() && steps.restack.outcome == 'failure'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        LABEL: ${{ inputs.label }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        mapfile -t nums < <(gh pr list --repo "$REPO" --state open \
+          --label "$LABEL" --json number -q '.[].number')
+        for n in "${nums[@]}"; do
+          gh pr edit "$n" --repo "$REPO" --remove-label "$LABEL" || true
+          gh pr comment "$n" --repo "$REPO" --body \
+            "Automated stack merge failed during the rebase step. The \`$LABEL\` label has been removed from all PRs in the stack. Please resolve conflicts locally, push, and re-apply the label on the top-most PR to retry. Run: $RUN_URL"
+        done
+        exit 1
+
+    - name: Enable auto-merge on new bottom
+      if: success() && steps.chain.outputs.found == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        LABEL: ${{ inputs.label }}
+        TRUNK: ${{ inputs.trunk }}
+      run: |
+        set -euo pipefail
+        new_bottom="$(gh pr list --repo "$REPO" --state open \
+          --label "$LABEL" --base "$TRUNK" \
+          --json number -q '.[0].number')"
+        if [[ -z "$new_bottom" ]]; then
+          echo "No labeled PR targeting $TRUNK remains — stack fully merged."
+          exit 0
+        fi
+        # Idempotent: see start/action.yml for rationale.
+        if ! out=$(gh pr merge "$new_bottom" --repo "$REPO" --squash --auto 2>&1); then
+          if [[ "$out" == *"Merge already in progress"* ]]; then
+            echo "Auto-merge already enabled on PR #$new_bottom."
+          else
+            echo "$out" >&2
+            exit 1
+          fi
+        fi
