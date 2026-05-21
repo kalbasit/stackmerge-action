@@ -44,11 +44,17 @@ runs:
         # Explicitly exclude the just-merged PR. `--state open` should
         # already filter it out, but GitHub's API can briefly report a
         # merged PR as still open due to eventual consistency.
+        # `--limit 1000` because gh's default of 30 silently truncates
+        # large stacks. `isCrossRepository == false` skips fork PRs —
+        # their branches can't be fetched from `origin`, so a later
+        # `git fetch` and rebase would fail. Same filters as the
+        # trailing-chain query below.
         gh pr list --repo "$REPO" --state open --label "$LABEL" \
-          --json number,headRefName,baseRefName \
+          --limit 1000 \
+          --json number,headRefName,baseRefName,isCrossRepository \
           | jq -r --argjson merged_num "$MERGED_PR_NUMBER" \
                --arg merged_ref "$MERGED_HEAD_REF" \
-               '.[] | select(.number != $merged_num and .headRefName != $merged_ref) | [.number, .headRefName, .baseRefName] | @tsv' \
+               '.[] | select(.number != $merged_num and .headRefName != $merged_ref and .isCrossRepository == false) | [.number, .headRefName, .baseRefName] | @tsv' \
           > /tmp/labeled.tsv
 
         # Always create chain.tsv (possibly empty). The rebase step
