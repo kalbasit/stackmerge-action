@@ -1,0 +1,75 @@
+name: Stackmerge — Start
+description: |
+  Triggered when a label is applied to the top-most PR of a stack.
+  Propagates the label down the base chain and enables GitHub's
+  squash-auto-merge on the bottom PR (the one whose base is the trunk).
+
+  Pair with `kalbasit/stackmerge-action/continue` in a separate workflow
+  that fires on `pull_request: closed`.
+
+inputs:
+  token:
+    description: |
+      GitHub token used to propagate the label and enable auto-merge.
+      A Personal Access Token with `repo` scope is required — the
+      built-in `GITHUB_TOKEN` cannot enable auto-merge on PRs it did
+      not author.
+    required: true
+  label:
+    description: "Label that triggers stack merging."
+    required: false
+    default: merge-stack
+  trunk:
+    description: "Trunk branch name."
+    required: false
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - name: Walk base chain and label each PR down to trunk
+      id: walk
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        LABEL: ${{ inputs.label }}
+        TRUNK: ${{ inputs.trunk }}
+      run: |
+        set -euo pipefail
+        pr="${{ github.event.pull_request.number }}"
+        while :; do
+          base="$(gh pr view "$pr" --repo "$REPO" --json baseRefName -q .baseRefName)"
+          if [[ "$base" == "$TRUNK" ]]; then
+            echo "bottom=$pr" >> "$GITHUB_OUTPUT"
+            break
+          fi
+          next="$(gh pr list --repo "$REPO" --state open --head "$base" \
+            --json number -q '.[0].number')"
+          if [[ -z "$next" ]]; then
+            echo "::error::Could not find an open PR for branch '$base'; stack is broken."
+            exit 1
+          fi
+          gh pr edit "$next" --repo "$REPO" --add-label "$LABEL"
+          pr="$next"
+        done
+
+    - name: Enable auto-merge on bottom PR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        BOTTOM: ${{ steps.walk.outputs.bottom }}
+      run: |
+        set -euo pipefail
+        # Idempotent: `gh pr merge --auto` returns "Merge already in
+        # progress" if auto-merge is already enabled. Treat that as
+        # success so retries don't fail.
+        if ! out=$(gh pr merge "$BOTTOM" --repo "$REPO" --squash --auto 2>&1); then
+          if [[ "$out" == *"Merge already in progress"* ]]; then
+            echo "Auto-merge already enabled on PR #$BOTTOM."
+          else
+            echo "$out" >&2
+            exit 1
+          fi
+        fi
