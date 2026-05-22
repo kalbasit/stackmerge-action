@@ -42,22 +42,28 @@ runs:
       run: |
         set -euo pipefail
         gh_retry() {
-          local max=5 attempt=0 delay=60 out rc
-          while (( ++attempt <= max )); do
-            out=$(gh "$@" 2>&1); rc=$?
-            if (( rc == 0 )); then
-              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          local out rc reset_ts reset_human
+          out=$(gh "$@" 2>&1); rc=$?
+          if (( rc == 0 )); then
+            [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          fi
+          if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+            reset_ts=$(gh api rate_limit \
+              --jq '[.resources.core.reset, .resources.graphql.reset] | max' \
+              2>/dev/null || echo 0)
+            if (( reset_ts > 0 )); then
+              reset_human=$(date -u -d "@$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || date -u -r "$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || printf '%s' "$reset_ts")
+            else
+              reset_human="unknown (gh api rate_limit also failed)"
             fi
-            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
-              if (( attempt < max )); then
-                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
-                  "$delay" "$attempt" "$max" >&2
-                sleep "$delay"; delay=$(( delay * 2 )); continue
-              fi
-            fi
-            printf '%s\n' "$out"; return "$rc"
-          done
-          printf '%s\n' "$out"; return 1
+            printf '::error::GitHub API rate limit exhausted. Reset at %s — re-run after that time.\n' \
+              "$reset_human" >&2
+            return "$rc"
+          fi
+          printf '%s\n' "$out"
+          return "$rc"
         }
         # Explicitly exclude the just-merged PR. `--state open` should
         # already filter it out, but GitHub's API can briefly report a
@@ -187,22 +193,28 @@ runs:
       run: |
         set -euo pipefail
         gh_retry() {
-          local max=5 attempt=0 delay=60 out rc
-          while (( ++attempt <= max )); do
-            out=$(gh "$@" 2>&1); rc=$?
-            if (( rc == 0 )); then
-              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          local out rc reset_ts reset_human
+          out=$(gh "$@" 2>&1); rc=$?
+          if (( rc == 0 )); then
+            [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          fi
+          if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+            reset_ts=$(gh api rate_limit \
+              --jq '[.resources.core.reset, .resources.graphql.reset] | max' \
+              2>/dev/null || echo 0)
+            if (( reset_ts > 0 )); then
+              reset_human=$(date -u -d "@$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || date -u -r "$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || printf '%s' "$reset_ts")
+            else
+              reset_human="unknown (gh api rate_limit also failed)"
             fi
-            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
-              if (( attempt < max )); then
-                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
-                  "$delay" "$attempt" "$max" >&2
-                sleep "$delay"; delay=$(( delay * 2 )); continue
-              fi
-            fi
-            printf '%s\n' "$out"; return "$rc"
-          done
-          printf '%s\n' "$out"; return 1
+            printf '::error::GitHub API rate limit exhausted. Reset at %s — re-run after that time.\n' \
+              "$reset_human" >&2
+            return "$rc"
+          fi
+          printf '%s\n' "$out"
+          return "$rc"
         }
 
         prev_old_tip="$MERGED_PR_HEAD_SHA"
@@ -305,22 +317,28 @@ runs:
       run: |
         set -euo pipefail
         gh_retry() {
-          local max=5 attempt=0 delay=60 out rc
-          while (( ++attempt <= max )); do
-            out=$(gh "$@" 2>&1); rc=$?
-            if (( rc == 0 )); then
-              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          local out rc reset_ts reset_human
+          out=$(gh "$@" 2>&1); rc=$?
+          if (( rc == 0 )); then
+            [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          fi
+          if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+            reset_ts=$(gh api rate_limit \
+              --jq '[.resources.core.reset, .resources.graphql.reset] | max' \
+              2>/dev/null || echo 0)
+            if (( reset_ts > 0 )); then
+              reset_human=$(date -u -d "@$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || date -u -r "$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || printf '%s' "$reset_ts")
+            else
+              reset_human="unknown (gh api rate_limit also failed)"
             fi
-            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
-              if (( attempt < max )); then
-                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
-                  "$delay" "$attempt" "$max" >&2
-                sleep "$delay"; delay=$(( delay * 2 )); continue
-              fi
-            fi
-            printf '%s\n' "$out"; return "$rc"
-          done
-          printf '%s\n' "$out"; return 1
+            printf '::error::GitHub API rate limit exhausted. Reset at %s — re-run after that time.\n' \
+              "$reset_human" >&2
+            return "$rc"
+          fi
+          printf '%s\n' "$out"
+          return "$rc"
         }
         mapfile -t nums < <(gh_retry pr list --repo "$REPO" --state open \
           --label "$LABEL" --json number -q '.[].number')
@@ -351,22 +369,28 @@ runs:
       run: |
         set -euo pipefail
         gh_retry() {
-          local max=5 attempt=0 delay=60 out rc
-          while (( ++attempt <= max )); do
-            out=$(gh "$@" 2>&1); rc=$?
-            if (( rc == 0 )); then
-              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          local out rc reset_ts reset_human
+          out=$(gh "$@" 2>&1); rc=$?
+          if (( rc == 0 )); then
+            [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          fi
+          if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+            reset_ts=$(gh api rate_limit \
+              --jq '[.resources.core.reset, .resources.graphql.reset] | max' \
+              2>/dev/null || echo 0)
+            if (( reset_ts > 0 )); then
+              reset_human=$(date -u -d "@$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || date -u -r "$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                         || printf '%s' "$reset_ts")
+            else
+              reset_human="unknown (gh api rate_limit also failed)"
             fi
-            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
-              if (( attempt < max )); then
-                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
-                  "$delay" "$attempt" "$max" >&2
-                sleep "$delay"; delay=$(( delay * 2 )); continue
-              fi
-            fi
-            printf '%s\n' "$out"; return "$rc"
-          done
-          printf '%s\n' "$out"; return 1
+            printf '::error::GitHub API rate limit exhausted. Reset at %s — re-run after that time.\n' \
+              "$reset_human" >&2
+            return "$rc"
+          fi
+          printf '%s\n' "$out"
+          return "$rc"
         }
         # If the bottom has already merged during this run, skip
         # gracefully — the merge event will trigger another continue
