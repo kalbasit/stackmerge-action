@@ -41,6 +41,24 @@ runs:
         MERGED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
       run: |
         set -euo pipefail
+        gh_retry() {
+          local max=5 attempt=0 delay=60 out rc
+          while (( ++attempt <= max )); do
+            out=$(gh "$@" 2>&1); rc=$?
+            if (( rc == 0 )); then
+              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+            fi
+            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+              if (( attempt < max )); then
+                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
+                  "$delay" "$attempt" "$max" >&2
+                sleep "$delay"; delay=$(( delay * 2 )); continue
+              fi
+            fi
+            printf '%s\n' "$out"; return "$rc"
+          done
+          printf '%s\n' "$out"; return 1
+        }
         # Explicitly exclude the just-merged PR. `--state open` should
         # already filter it out, but GitHub's API can briefly report a
         # merged PR as still open due to eventual consistency.
@@ -49,7 +67,7 @@ runs:
         # their branches can't be fetched from `origin`, so a later
         # `git fetch` and rebase would fail. Same filters as the
         # trailing-chain query below.
-        gh pr list --repo "$REPO" --state open --label "$LABEL" \
+        gh_retry pr list --repo "$REPO" --state open --label "$LABEL" \
           --limit 1000 \
           --json number,headRefName,baseRefName,isCrossRepository \
           | jq -r --argjson merged_num "$MERGED_PR_NUMBER" \
@@ -168,6 +186,24 @@ runs:
         MERGED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -euo pipefail
+        gh_retry() {
+          local max=5 attempt=0 delay=60 out rc
+          while (( ++attempt <= max )); do
+            out=$(gh "$@" 2>&1); rc=$?
+            if (( rc == 0 )); then
+              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+            fi
+            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+              if (( attempt < max )); then
+                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
+                  "$delay" "$attempt" "$max" >&2
+                sleep "$delay"; delay=$(( delay * 2 )); continue
+              fi
+            fi
+            printf '%s\n' "$out"; return "$rc"
+          done
+          printf '%s\n' "$out"; return 1
+        }
 
         prev_old_tip="$MERGED_PR_HEAD_SHA"
         # Use origin/<trunk> directly — avoids creating a local trunk
@@ -212,7 +248,7 @@ runs:
         # GitHub auto-retargets dependent PRs to the trunk as soon as
         # their base branch is deleted, so base-ref queries can't
         # reliably identify a trailing chain after a merge.
-        mapfile -t open_prs < <(gh pr list --repo "$REPO" --state open \
+        mapfile -t open_prs < <(gh_retry pr list --repo "$REPO" --state open \
           --limit 1000 \
           --json number,headRefName,isCrossRepository \
           -q '.[] | select(.isCrossRepository == false) | [.number, .headRefName] | @tsv')
@@ -268,11 +304,29 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         set -euo pipefail
-        mapfile -t nums < <(gh pr list --repo "$REPO" --state open \
+        gh_retry() {
+          local max=5 attempt=0 delay=60 out rc
+          while (( ++attempt <= max )); do
+            out=$(gh "$@" 2>&1); rc=$?
+            if (( rc == 0 )); then
+              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+            fi
+            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+              if (( attempt < max )); then
+                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
+                  "$delay" "$attempt" "$max" >&2
+                sleep "$delay"; delay=$(( delay * 2 )); continue
+              fi
+            fi
+            printf '%s\n' "$out"; return "$rc"
+          done
+          printf '%s\n' "$out"; return 1
+        }
+        mapfile -t nums < <(gh_retry pr list --repo "$REPO" --state open \
           --label "$LABEL" --json number -q '.[].number')
         for n in "${nums[@]}"; do
-          gh pr edit "$n" --repo "$REPO" --remove-label "$LABEL" || true
-          gh pr comment "$n" --repo "$REPO" --body \
+          gh_retry pr edit "$n" --repo "$REPO" --remove-label "$LABEL" || true
+          gh_retry pr comment "$n" --repo "$REPO" --body \
             "Automated stack merge failed during the rebase step. The \`$LABEL\` label has been removed from all PRs in the stack. Please resolve conflicts locally, push, and re-apply the label on the top-most PR to retry. Run: $RUN_URL"
         done
         exit 1
@@ -296,18 +350,40 @@ runs:
         BOTTOM_NUM: ${{ steps.chain.outputs.bottom_num }}
       run: |
         set -euo pipefail
+        gh_retry() {
+          local max=5 attempt=0 delay=60 out rc
+          while (( ++attempt <= max )); do
+            out=$(gh "$@" 2>&1); rc=$?
+            if (( rc == 0 )); then
+              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+            fi
+            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+              if (( attempt < max )); then
+                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
+                  "$delay" "$attempt" "$max" >&2
+                sleep "$delay"; delay=$(( delay * 2 )); continue
+              fi
+            fi
+            printf '%s\n' "$out"; return "$rc"
+          done
+          printf '%s\n' "$out"; return 1
+        }
         # If the bottom has already merged during this run, skip
         # gracefully — the merge event will trigger another continue
         # run that picks up the now-new bottom.
-        state="$(gh pr view "$BOTTOM_NUM" --repo "$REPO" --json state -q .state)"
+        state="$(gh_retry pr view "$BOTTOM_NUM" --repo "$REPO" --json state -q .state)"
         if [[ "$state" != "OPEN" ]]; then
           echo "PR #$BOTTOM_NUM is $state; the continue run triggered by its merge will handle the next bottom."
           exit 0
         fi
-        # Idempotent: see start/action.yml for rationale.
-        if ! out=$(gh pr merge "$BOTTOM_NUM" --repo "$REPO" --squash --auto 2>&1); then
+        # Idempotent: treat both "Merge already in progress" (auto-merge
+        # queued but PR not yet merged) and "Pull request is already merged"
+        # (race: PR merged before this step ran) as success.
+        if ! out=$(gh_retry pr merge "$BOTTOM_NUM" --repo "$REPO" --squash --auto); then
           if [[ "$out" == *"Merge already in progress"* ]]; then
             echo "Auto-merge already enabled on PR #$BOTTOM_NUM."
+          elif [[ "$out" == *"Pull request is already merged"* ]]; then
+            echo "PR #$BOTTOM_NUM is already merged; nothing to do."
           else
             echo "$out" >&2
             exit 1

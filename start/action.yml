@@ -37,21 +37,39 @@ runs:
         TRUNK: ${{ inputs.trunk }}
       run: |
         set -euo pipefail
+        gh_retry() {
+          local max=5 attempt=0 delay=60 out rc
+          while (( ++attempt <= max )); do
+            out=$(gh "$@" 2>&1); rc=$?
+            if (( rc == 0 )); then
+              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+            fi
+            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+              if (( attempt < max )); then
+                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
+                  "$delay" "$attempt" "$max" >&2
+                sleep "$delay"; delay=$(( delay * 2 )); continue
+              fi
+            fi
+            printf '%s\n' "$out"; return "$rc"
+          done
+          printf '%s\n' "$out"; return 1
+        }
         pr="${{ github.event.pull_request.number }}"
         while :; do
-          base="$(gh pr view "$pr" --repo "$REPO" --json baseRefName -q .baseRefName)"
+          base="$(gh_retry pr view "$pr" --repo "$REPO" --json baseRefName -q .baseRefName)"
           if [[ "$base" == "$TRUNK" ]]; then
             echo "bottom=$pr" >> "$GITHUB_OUTPUT"
             break
           fi
-          next="$(gh pr list --repo "$REPO" --state open --head "$base" \
+          next="$(gh_retry pr list --repo "$REPO" --state open --head "$base" \
             --json number -q '.[0].number')"
           if [[ -z "$next" ]]; then
             # Race: GitHub retargets a PR's base to trunk only after its
             # parent branch is deleted post-merge. If continue fires
             # start before retargeting completes, we'll find no open PR
             # for the base — but the current PR is already the bottom.
-            merged="$(gh pr list --repo "$REPO" --state merged --head "$base" \
+            merged="$(gh_retry pr list --repo "$REPO" --state merged --head "$base" \
               --json number -q '.[0].number')"
             if [[ -n "$merged" ]]; then
               echo "bottom=$pr" >> "$GITHUB_OUTPUT"
@@ -60,7 +78,7 @@ runs:
             echo "::error::Could not find an open PR for branch '$base'; stack is broken."
             exit 1
           fi
-          gh pr edit "$next" --repo "$REPO" --add-label "$LABEL"
+          gh_retry pr edit "$next" --repo "$REPO" --add-label "$LABEL"
           pr="$next"
         done
 
@@ -72,10 +90,28 @@ runs:
         BOTTOM: ${{ steps.walk.outputs.bottom }}
       run: |
         set -euo pipefail
+        gh_retry() {
+          local max=5 attempt=0 delay=60 out rc
+          while (( ++attempt <= max )); do
+            out=$(gh "$@" 2>&1); rc=$?
+            if (( rc == 0 )); then
+              [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+            fi
+            if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+              if (( attempt < max )); then
+                printf '::warning::GitHub API rate limit; waiting %ds (attempt %d/%d)...\n' \
+                  "$delay" "$attempt" "$max" >&2
+                sleep "$delay"; delay=$(( delay * 2 )); continue
+              fi
+            fi
+            printf '%s\n' "$out"; return "$rc"
+          done
+          printf '%s\n' "$out"; return 1
+        }
         # Idempotent: treat both "Merge already in progress" (auto-merge
         # queued but PR not yet merged) and "Pull request is already merged"
         # (race: PR merged before this step ran) as success.
-        if ! out=$(gh pr merge "$BOTTOM" --repo "$REPO" --squash --auto 2>&1); then
+        if ! out=$(gh_retry pr merge "$BOTTOM" --repo "$REPO" --squash --auto); then
           if [[ "$out" == *"Merge already in progress"* ]]; then
             echo "Auto-merge already enabled on PR #$BOTTOM."
           elif [[ "$out" == *"Pull request is already merged"* ]]; then
