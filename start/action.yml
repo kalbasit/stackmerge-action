@@ -27,23 +27,21 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Walk base chain and label each PR down to trunk
-      id: walk
+    - name: Write gh_retry helper
       shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.token }}
-        REPO: ${{ github.repository }}
-        LABEL: ${{ inputs.label }}
-        TRUNK: ${{ inputs.trunk }}
       run: |
-        set -euo pipefail
+        cat > /tmp/gh_retry.sh << 'HELPER'
         gh_retry() {
-          local out rc reset_ts reset_human
-          out=$(gh "$@" 2>&1); rc=$?
-          if (( rc == 0 )); then
-            [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+          local _rc _errfile _err reset_ts reset_human
+          _errfile=$(mktemp)
+          trap 'rm -f "$_errfile"' RETURN
+          gh "$@" 2>"$_errfile"
+          _rc=$?
+          if (( _rc == 0 )); then
+            return 0
           fi
-          if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
+          _err=$(<"$_errfile")
+          if [[ "$_err" == *"rate limit"* || "$_err" == *"API rate limit"* ]]; then
             reset_ts=$(gh api rate_limit \
               --jq '[.resources.core.reset, .resources.graphql.reset] | max' \
               2>/dev/null || echo 0)
@@ -54,13 +52,27 @@ runs:
             else
               reset_human="unknown (gh api rate_limit also failed)"
             fi
+            printf '%s\n' "$_err" >&2
             printf '::error::GitHub API rate limit exhausted. Reset at %s — re-run after that time.\n' \
               "$reset_human" >&2
-            return "$rc"
+            return "$_rc"
           fi
-          printf '%s\n' "$out"
-          return "$rc"
+          printf '%s\n' "$_err" >&2
+          return "$_rc"
         }
+        HELPER
+
+    - name: Walk base chain and label each PR down to trunk
+      id: walk
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        LABEL: ${{ inputs.label }}
+        TRUNK: ${{ inputs.trunk }}
+      run: |
+        set -euo pipefail
+        source /tmp/gh_retry.sh
         pr="${{ github.event.pull_request.number }}"
         while :; do
           base="$(gh_retry pr view "$pr" --repo "$REPO" --json baseRefName -q .baseRefName)"
@@ -96,34 +108,11 @@ runs:
         BOTTOM: ${{ steps.walk.outputs.bottom }}
       run: |
         set -euo pipefail
-        gh_retry() {
-          local out rc reset_ts reset_human
-          out=$(gh "$@" 2>&1); rc=$?
-          if (( rc == 0 )); then
-            [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
-          fi
-          if [[ "$out" == *"rate limit"* || "$out" == *"API rate limit"* ]]; then
-            reset_ts=$(gh api rate_limit \
-              --jq '[.resources.core.reset, .resources.graphql.reset] | max' \
-              2>/dev/null || echo 0)
-            if (( reset_ts > 0 )); then
-              reset_human=$(date -u -d "@$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
-                         || date -u -r "$reset_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
-                         || printf '%s' "$reset_ts")
-            else
-              reset_human="unknown (gh api rate_limit also failed)"
-            fi
-            printf '::error::GitHub API rate limit exhausted. Reset at %s — re-run after that time.\n' \
-              "$reset_human" >&2
-            return "$rc"
-          fi
-          printf '%s\n' "$out"
-          return "$rc"
-        }
+        source /tmp/gh_retry.sh
         # Idempotent: treat both "Merge already in progress" (auto-merge
         # queued but PR not yet merged) and "Pull request is already merged"
         # (race: PR merged before this step ran) as success.
-        if ! out=$(gh_retry pr merge "$BOTTOM" --repo "$REPO" --squash --auto); then
+        if ! out=$(gh_retry pr merge "$BOTTOM" --repo "$REPO" --squash --auto 2>&1); then
           if [[ "$out" == *"Merge already in progress"* ]]; then
             echo "Auto-merge already enabled on PR #$BOTTOM."
           elif [[ "$out" == *"Pull request is already merged"* ]]; then
