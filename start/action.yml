@@ -72,12 +72,14 @@ runs:
         BOTTOM: ${{ steps.walk.outputs.bottom }}
       run: |
         set -euo pipefail
-        # Idempotent: `gh pr merge --auto` returns "Merge already in
-        # progress" if auto-merge is already enabled. Treat that as
-        # success so retries don't fail.
+        # Idempotent: treat both "Merge already in progress" (auto-merge
+        # queued but PR not yet merged) and "Pull request is already merged"
+        # (race: PR merged before this step ran) as success.
         if ! out=$(gh pr merge "$BOTTOM" --repo "$REPO" --squash --auto 2>&1); then
           if [[ "$out" == *"Merge already in progress"* ]]; then
             echo "Auto-merge already enabled on PR #$BOTTOM."
+          elif [[ "$out" == *"Pull request is already merged"* ]]; then
+            echo "PR #$BOTTOM is already merged; nothing to do."
           else
             echo "$out" >&2
             exit 1
