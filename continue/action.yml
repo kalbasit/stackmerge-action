@@ -324,6 +324,38 @@ runs:
         done
         exit 1
 
+    - name: Wait for check runs to appear on new bottom HEAD
+      # After a force-push the new HEAD SHA has zero check runs. If the
+      # target repo's ruleset has do_not_enforce_on_create=true (GitHub's
+      # default), GitHub treats absent checks as satisfied and auto-merge
+      # can fire instantly — before CI even allocates a runner. Waiting
+      # here ensures at least one check run is in flight before we hand
+      # off to auto-merge.
+      if: success() && steps.chain.outputs.bottom_num != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        BOTTOM_NUM: ${{ steps.chain.outputs.bottom_num }}
+      run: |
+        set -euo pipefail
+        source /tmp/gh_retry.sh
+        head_sha="$(gh_retry pr view "$BOTTOM_NUM" --repo "$REPO" \
+          --json headRefOid -q .headRefOid)"
+        echo "Waiting for check runs to appear on $head_sha (PR #$BOTTOM_NUM)..."
+        for i in $(seq 1 10); do
+          count="$(gh_retry api \
+            "repos/$REPO/commits/$head_sha/check-runs" \
+            --jq '.check_runs | length')"
+          if [[ "$count" -gt 0 ]]; then
+            echo "Check runs present ($count). Proceeding to enable auto-merge."
+            exit 0
+          fi
+          echo "  attempt $i/10: no check runs yet, waiting 30s..."
+          sleep 30
+        done
+        echo "::warning::No check runs appeared on $head_sha after 5 minutes. Enabling auto-merge anyway."
+
     - name: Enable auto-merge on new bottom
       # Skip when bottom_num is empty — that means the labeled chain
       # was empty for this run (only the trailing pass executed), so
